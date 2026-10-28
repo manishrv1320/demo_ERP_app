@@ -1,0 +1,65 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# next.js
+/.next/
+/out/
+next-env.d.ts
+
+# production
+/build
+
+# local database (PGlite dev server) and test databases
+/.pgdata
+/.pgdata-*
+/.testdb-*
+
+# private file storage, if pointed inside the repo by mistake
+/storage/
+
+# tests
+/coverage
+
+# secrets: environment files, keys, keystores, Firebase config
+.env
+.env.*
+*.env
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+keystore.properties
+google-services.json
+GoogleService-Info.plist
+
+# android build output and local machine settings
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/app/release/
+/android/local.properties
+/android/.idea/
+/android/captures/
+*.apk
+*.aab
+
+# misc
+.DS_Store
+Thumbs.db
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# typescript
+*.tsbuildinfo
+
+# local run logs
+*.log
