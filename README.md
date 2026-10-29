@@ -56,6 +56,10 @@ npm run dev            # http://localhost:3000
 PGlite serves one connection at a time. If a migration or script waits and times out, stop `npm run dev`
 (or `next start`) first — it holds the connection.
 
+Stop `npm run db:dev` with **Ctrl+C**, never by killing the process: a hard kill can leave `.pgdata` unreadable
+("RuntimeError: Aborted()"). If that happens, rename `.pgdata` (e.g. to `.pgdata-damaged`, git-ignored), run
+`npm run db:dev` again and then `npm run db:deploy && npm run db:seed`. Local data only — production uses real PostgreSQL.
+
 ## Rules this code keeps
 
 1. **Self-hosted.** All data is in our PostgreSQL and on our server's disk. Live updates use polling (the
