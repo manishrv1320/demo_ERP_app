@@ -1,0 +1,8 @@
+# Server scripts, the Dockerfile and SQL migrations must keep LF endings even
+# when checked out on Windows with core.autocrlf on.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary
+*.jar binary
+*.webp binary

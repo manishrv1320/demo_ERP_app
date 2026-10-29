@@ -1,0 +1,612 @@
+// Hyperzen ERP — database schema.
+//
+// Conventions (see docs/phase-0-plan.md, section 3):
+//   • Every tenant model has `organizationId`, `@@unique([organizationId, id])`,
+//     and every unique constraint / index starts with `organizationId`.
+//   • Links between tenant models are composite foreign keys
+//     (organizationId, xId) → (organizationId, id), so a row can never point at
+//     another organization's row. Write them as scalar ids, never `connect`.
+//   • Money is BigInt paise, quantities BigInt thousandths, rates Int basis points.
+//   • Global (non-tenant) models never have a field called `organizationId`;
+//     platform tables that refer to an organization call it `targetOrganizationId`.
+//
+// Changes go through `npm run db:migrate` (Prisma migrations), never db push.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider          = "postgresql"
+  url               = env("DATABASE_URL")
+  // Only `prisma migrate dev` reads this (local: the PGlite shadow on 5444).
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity (global)
+// ---------------------------------------------------------------------------
+
+enum UserStatus {
+  ACTIVE
+  PENDING_DELETION
+  DELETED
+}
+
+model User {
+  id                   String     @id @default(cuid())
+  email                String     @unique
+  phone                String?
+  name                 String
+  passwordHash         String
+  passwordChangedAt    DateTime   @default(now())
+  emailVerifiedAt      DateTime?
+  status               UserStatus @default(ACTIVE)
+  deletionRequestedAt  DateTime?
+  deletionScheduledFor DateTime?
+  lastLoginAt          DateTime?
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+
+  sessions      Session[]
+  codes         VerificationCode[]
+  memberships   Membership[]
+  acceptances   PolicyAcceptance[]
+  notifications Notification[]
+
+  @@index([phone])
+  @@index([status, deletionScheduledFor])
+}
+
+model Session {
+  id                   String   @id @default(cuid())
+  tokenHash            String   @unique
+  userId               String
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// The organization this session is working in. Membership is re-checked on every request.
+  activeOrganizationId String?
+  /// Set when the Android app's user-agent suffix was seen. UI hint only — never used for security.
+  isApp                Boolean  @default(false)
+  ip                   String?
+  userAgent            String?
+  lastSeenAt           DateTime @default(now())
+  expiresAt            DateTime
+  createdAt            DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+enum CodePurpose {
+  RESET
+  VERIFY_EMAIL
+}
+
+enum CodeChannel {
+  EMAIL
+  SMS
+}
+
+/// One-time 6-digit codes for password reset and email verification. Only hashes are stored.
+model VerificationCode {
+  id             String      @id @default(cuid())
+  userId         String
+  user           User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  purpose        CodePurpose
+  channel        CodeChannel
+  destination    String
+  codeHash       String
+  attempts       Int         @default(0)
+  expiresAt      DateTime
+  consumedAt     DateTime?
+  /// After a correct reset code: a short-lived token (hashed) that allows setting the new password.
+  resetTokenHash String?     @unique
+  resetExpiresAt DateTime?
+  ip             String?
+  createdAt      DateTime    @default(now())
+
+  @@index([userId, purpose, createdAt])
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------------
+// Platform console (global; Hyperzen staff only)
+// ---------------------------------------------------------------------------
+
+model PlatformAdmin {
+  id                String    @id @default(cuid())
+  email             String    @unique
+  name              String
+  passwordHash      String
+  passwordChangedAt DateTime  @default(now())
+  isActive          Boolean   @default(true)
+  lastLoginAt       DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  sessions        PlatformSession[]
+  supportSessions SupportSession[]
+  auditLogs       PlatformAuditLog[]
+}
+
+model PlatformSession {
+  id              String        @id @default(cuid())
+  tokenHash       String        @unique
+  platformAdminId String
+  platformAdmin   PlatformAdmin @relation(fields: [platformAdminId], references: [id], onDelete: Cascade)
+  ip              String?
+  userAgent       String?
+  expiresAt       DateTime
+  createdAt       DateTime      @default(now())
+
+  @@index([platformAdminId])
+  @@index([expiresAt])
+}
+
+/// A short-lived, read-only look into one organization for support. Every page visit is logged.
+model SupportSession {
+  id                   String        @id @default(cuid())
+  tokenHash            String        @unique
+  platformAdminId      String
+  platformAdmin        PlatformAdmin @relation(fields: [platformAdminId], references: [id], onDelete: Restrict)
+  targetOrganizationId String
+  reason               String
+  expiresAt            DateTime
+  endedAt              DateTime?
+  createdAt            DateTime      @default(now())
+
+  visits SupportAccessLog[]
+
+  @@index([targetOrganizationId, createdAt])
+  @@index([platformAdminId, createdAt])
+}
+
+model SupportAccessLog {
+  id                   String         @id @default(cuid())
+  supportSessionId     String
+  supportSession       SupportSession @relation(fields: [supportSessionId], references: [id], onDelete: Cascade)
+  targetOrganizationId String
+  path                 String
+  at                   DateTime       @default(now())
+
+  @@index([targetOrganizationId, at])
+  @@index([supportSessionId, at])
+}
+
+model PlatformAuditLog {
+  id                   String         @id @default(cuid())
+  platformAdminId      String?
+  platformAdmin        PlatformAdmin? @relation(fields: [platformAdminId], references: [id], onDelete: SetNull)
+  action               String
+  targetOrganizationId String?
+  detail               Json?
+  ip                   String?
+  createdAt            DateTime       @default(now())
+
+  @@index([targetOrganizationId, createdAt])
+  @@index([createdAt])
+}
+
+/// Singleton row (id = "platform"): the system SMTP used for sign-up, reset and invite mail.
+model PlatformSettings {
+  id              String   @id @default("platform")
+  smtpEnabled     Boolean  @default(false)
+  smtpHost        String?
+  smtpPort        Int?
+  smtpSecure      Boolean  @default(false)
+  smtpUser        String?
+  /// AES-256-GCM, see src/server/security/encryption.ts
+  smtpPasswordEnc String?
+  smtpFromName    String?
+  smtpFromEmail   String?
+  supportEmail    String?
+  updatedAt       DateTime @updatedAt
+}
+
+/// Terms and Privacy. Platform-wide; each user accepts each version.
+model Policy {
+  id        String   @id @default(cuid())
+  slug      String   @unique
+  title     String
+  /// Plain text: blank lines separate paragraphs, lines starting "## " are headings.
+  content   String
+  version   Int      @default(1)
+  versionAt DateTime @default(now())
+  isActive  Boolean  @default(true)
+  updatedAt DateTime @updatedAt
+
+  acceptances PolicyAcceptance[]
+}
+
+model PolicyAcceptance {
+  id         String   @id @default(cuid())
+  policyId   String
+  policy     Policy   @relation(fields: [policyId], references: [id], onDelete: Restrict)
+  version    Int
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ip         String?
+  userAgent  String?
+  acceptedAt DateTime @default(now())
+
+  @@unique([policyId, version, userId])
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Organization (the tenant root), members, roles, settings
+// ---------------------------------------------------------------------------
+
+enum OrganizationStatus {
+  ACTIVE
+  SUSPENDED
+  PENDING_DELETION
+}
+
+enum GstRegistration {
+  REGULAR
+  COMPOSITION
+  UNREGISTERED
+}
+
+model Organization {
+  id                    String             @id @default(cuid())
+  legalName             String
+  tradeName             String?
+  gstin                 String?
+  pan                   String?
+  gstRegistration       GstRegistration    @default(UNREGISTERED)
+  /// Two-digit GST state code, e.g. "29" for Karnataka.
+  stateCode             String
+  addressLine1          String?
+  addressLine2          String?
+  city                  String?
+  pincode               String?
+  phone                 String?
+  email                 String?
+  website               String?
+  logoFileId            String?
+  accentColor           String?
+  accentColor2          String?
+  booksStartDate        DateTime           @db.Date
+  /// Nothing can be posted, cancelled or reversed on or before this date.
+  lockDate              DateTime?          @db.Date
+  status                OrganizationStatus @default(ACTIVE)
+  suspendedAt           DateTime?
+  suspendedReason       String?
+  deletionRequestedAt   DateTime?
+  deletionRequestedById String?
+  deletionScheduledFor  DateTime?
+  isDemo                Boolean            @default(false)
+  version               Int                @default(1)
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
+
+  settings       OrganizationSettings?
+  roles          Role[]
+  memberships    Membership[]
+  invitations    Invitation[]
+  branches       Branch[]
+  warehouses     Warehouse[]
+  financialYears FinancialYear[]
+  numberSeries   NumberSeries[]
+  activityLogs   ActivityLog[]
+  notifications  Notification[]
+  revisions      Revision[]
+  files          StoredFile[]
+
+  @@index([status, deletionScheduledFor])
+  @@index([createdAt])
+}
+
+enum NegativeStockPolicy {
+  BLOCK
+  ALLOW
+}
+
+model OrganizationSettings {
+  id                        String              @id @default(cuid())
+  organizationId            String              @unique
+  organization              Organization        @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  roundOffTotals            Boolean             @default(true)
+  negativeStock             NegativeStockPolicy @default(BLOCK)
+  defaultDueDays            Int                 @default(30)
+  invoiceTerms              String?
+  invoiceNotes              String?
+  upiId                     String?
+  upiPayeeName              String?
+  smtpEnabled               Boolean             @default(false)
+  smtpHost                  String?
+  smtpPort                  Int?
+  smtpSecure                Boolean             @default(false)
+  smtpUser                  String?
+  /// AES-256-GCM, see src/server/security/encryption.ts
+  smtpPasswordEnc           String?
+  smtpFromName              String?
+  smtpFromEmail             String?
+  notificationRetentionDays Int                 @default(90)
+  lastNotificationPurgeAt   DateTime?
+  attendanceLocationEnabled Boolean             @default(false)
+  version                   Int                 @default(1)
+  updatedAt                 DateTime            @updatedAt
+
+  @@unique([organizationId, id])
+}
+
+model Role {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  key            String
+  name           String
+  description    String?
+  /// string[] of capability keys from src/lib/rbac.ts
+  capabilities   Json
+  /// Lower is more senior. Owner is 0.
+  rank           Int
+  isSystem       Boolean      @default(false)
+  version        Int          @default(1)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  memberships Membership[]
+  invitations Invitation[]
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, key])
+  @@index([organizationId, rank])
+}
+
+enum MembershipStatus {
+  ACTIVE
+  REMOVED
+}
+
+model Membership {
+  id             String           @id @default(cuid())
+  organizationId String
+  organization   Organization     @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  userId         String
+  user           User             @relation(fields: [userId], references: [id], onDelete: Restrict)
+  roleId         String
+  role           Role             @relation(fields: [organizationId, roleId], references: [organizationId, id], onDelete: Restrict)
+  status         MembershipStatus @default(ACTIVE)
+  joinedAt       DateTime         @default(now())
+  removedAt      DateTime?
+  updatedAt      DateTime         @updatedAt
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, userId])
+  @@index([organizationId, roleId])
+  @@index([userId])
+}
+
+model Invitation {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  email          String
+  roleId         String
+  role           Role         @relation(fields: [organizationId, roleId], references: [organizationId, id], onDelete: Restrict)
+  /// Looked up before the person belongs to the organization, so it's globally unique.
+  tokenHash      String       @unique
+  invitedById    String
+  invitedByName  String
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  revokedAt      DateTime?
+  createdAt      DateTime     @default(now())
+
+  @@unique([organizationId, id])
+  @@index([organizationId, email])
+  @@index([organizationId, createdAt])
+}
+
+model Branch {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  name           String
+  code           String
+  /// A branch registered in another state has its own GSTIN.
+  gstin          String?
+  stateCode      String
+  addressLine1   String?
+  addressLine2   String?
+  city           String?
+  pincode        String?
+  phone          String?
+  isHeadOffice   Boolean      @default(false)
+  isActive       Boolean      @default(true)
+  version        Int          @default(1)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  warehouses   Warehouse[]
+  numberSeries NumberSeries[]
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, code])
+  @@index([organizationId, isActive, name])
+}
+
+model Warehouse {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  branchId       String
+  branch         Branch       @relation(fields: [organizationId, branchId], references: [organizationId, id], onDelete: Restrict)
+  name           String
+  code           String
+  address        String?
+  isActive       Boolean      @default(true)
+  version        Int          @default(1)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, code])
+  @@index([organizationId, branchId])
+}
+
+model FinancialYear {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  /// e.g. "2026-27"
+  label          String
+  startDate      DateTime     @db.Date
+  endDate        DateTime     @db.Date
+  isClosed       Boolean      @default(false)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  numberSeries NumberSeries[]
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, startDate])
+}
+
+enum DocumentType {
+  QUOTATION
+  SALES_ORDER
+  DELIVERY_NOTE
+  SALES_INVOICE
+  CREDIT_NOTE
+  RECEIPT
+  PURCHASE_ORDER
+  GOODS_RECEIPT
+  PURCHASE_BILL
+  DEBIT_NOTE
+  PAYMENT
+  EXPENSE
+  JOURNAL
+  CONTRA
+  STOCK_TRANSFER
+  STOCK_ADJUSTMENT
+  OPENING_STOCK
+}
+
+enum NumberingMode {
+  AUTO
+  MANUAL
+}
+
+/// Gapless counters. The number is taken inside the posting transaction.
+model NumberSeries {
+  id              String        @id @default(cuid())
+  organizationId  String
+  organization    Organization  @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  documentType    DocumentType
+  financialYearId String
+  financialYear   FinancialYear @relation(fields: [organizationId, financialYearId], references: [organizationId, id], onDelete: Restrict)
+  branchId        String
+  branch          Branch        @relation(fields: [organizationId, branchId], references: [organizationId, id], onDelete: Restrict)
+  /// e.g. "INV/{FY}/" — tokens {FY} {YYYY} {YY} {MM}
+  prefix          String
+  padding         Int           @default(4)
+  nextNumber      Int           @default(1)
+  mode            NumberingMode @default(AUTO)
+  version         Int           @default(1)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, documentType, financialYearId, branchId])
+  @@index([organizationId, financialYearId])
+  @@index([organizationId, branchId])
+}
+
+// ---------------------------------------------------------------------------
+// Activity, notifications, revisions, files
+// ---------------------------------------------------------------------------
+
+/// The audit trail. Entries for accounting records are never purged (Companies (Accounts) Rules).
+model ActivityLog {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  actorUserId    String?
+  actorName      String
+  action         String
+  entityType     String
+  entityId       String?
+  summary        String
+  ip             String?
+  createdAt      DateTime     @default(now())
+
+  @@unique([organizationId, id])
+  @@index([organizationId, createdAt])
+  @@index([organizationId, entityType, entityId])
+}
+
+enum NotificationLevel {
+  INFO
+  SUCCESS
+  WARNING
+  ERROR
+}
+
+model Notification {
+  id              String            @id @default(cuid())
+  organizationId  String
+  organization    Organization      @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  recipientUserId String
+  recipient       User              @relation(fields: [recipientUserId], references: [id], onDelete: Cascade)
+  kind            String
+  level           NotificationLevel @default(INFO)
+  title           String
+  body            String?
+  href            String?
+  entityType      String?
+  entityId        String?
+  readAt          DateTime?
+  createdAt       DateTime          @default(now())
+
+  @@unique([organizationId, id])
+  @@index([organizationId, recipientUserId, readAt, createdAt])
+  @@index([organizationId, createdAt])
+}
+
+/// Restorable snapshot of a record, taken before every edit or delete.
+model Revision {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  entityType     String
+  entityId       String
+  data           Json
+  label          String
+  authorUserId   String?
+  authorName     String
+  createdAt      DateTime     @default(now())
+
+  @@unique([organizationId, id])
+  @@index([organizationId, entityType, entityId, createdAt])
+}
+
+enum FileCategory {
+  LOGO
+  RECEIPT
+  ATTACHMENT
+  BANK_STATEMENT
+  PAYSLIP
+}
+
+/// A private, encrypted file on the server's disk under orgs/<organizationId>/.
+model StoredFile {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  category       FileCategory
+  storagePath    String
+  originalName   String
+  mimeType       String
+  size           Int
+  sha256         String
+  uploadedById   String?
+  createdAt      DateTime     @default(now())
+
+  @@unique([organizationId, id])
+  @@index([organizationId, category, createdAt])
+}

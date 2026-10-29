@@ -63,3 +63,6 @@ yarn-error.log*
 
 # local run logs
 *.log
+
+# platform admin credentials written by scripts/create-platform-admin.ts
+platform-admin-*.txt
